@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   LayoutGrid, 
   FileText, 
@@ -23,21 +23,35 @@ import {
   LogOut,
   ChevronRight,
   Award,
-  Video
+  Video,
+  Loader2
 } from 'lucide-react';
 import GenLancerLogo from '../auth/GenLancerLogo';
+import { supabase } from '../../lib/supabase';
+import { sendChatMessage, fetchChatMessages } from '../../lib/chatService';
+import PromptInspectorModal from '../common/PromptInspectorModal';
+import ChatLockoutOverlay from '../common/ChatLockoutOverlay';
+import VerificationBadge, { VerifiedWorkflowBadge, CertifiedPipelineBadge, AICreatorScoreBadge } from '../common/VerificationBadge';
+import ClarificationModal from '../common/ClarificationModal';
+import BriefVersionBadge from '../common/BriefVersionBadge';
 
 export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
   const [activeTab, setActiveTab] = useState('portfolio'); // 'portfolio' | 'requests' | 'messages' | 'work'
   const [isAuditing, setIsAuditing] = useState(false);
   const [auditScore, setAuditScore] = useState(94);
   const [auditNotification, setAuditNotification] = useState(null);
+  const [selectedAssetForInspect, setSelectedAssetForInspect] = useState(null);
 
   // Settings Modal State
   const [showSettingsModal, setShowSettingsModal] = useState(false);
 
   // Upload Work Modal State
   const [showUploadModal, setShowUploadModal] = useState(false);
+
+  // Clarification Modal State
+  const [clarifyModalReq, setClarifyModalReq] = useState(null);
+  const [clarifyText, setClarifyText] = useState('');
+  const [isSubmittingClarify, setIsSubmittingClarify] = useState(false);
 
   // Creator Info State (Editable via Settings)
   const [creator, setCreator] = useState({
@@ -86,10 +100,11 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
     seed: ''
   });
 
-  // Incoming Requests from Brands
-  const [incomingRequests, setIncomingRequests] = useState([
+  // Default mock requests for offline resilience
+  const DEFAULT_REQUESTS = [
     {
       id: "req-1",
+      request_id: "req-1",
       company: "Volt Energy Co.",
       campaignTitle: "Cyberpunk Beverage Ad Campaign",
       budget: "$4,500",
@@ -100,6 +115,7 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
     },
     {
       id: "req-2",
+      request_id: "req-2",
       company: "Aura Skincare",
       campaignTitle: "Organic Botanical AI Render Series",
       budget: "$2,200",
@@ -108,7 +124,125 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
       style: "Soft luxury lighting, pastel botanicals, minimalist studio",
       status: "pending"
     }
-  ]);
+  ];
+
+  // Incoming Requests from Brands (Live Supabase State)
+  const [incomingRequests, setIncomingRequests] = useState([]);
+  const [loadingRequests, setLoadingRequests] = useState(true);
+
+  // Fetch Live Briefs from Supabase collaboration_requests with Polling
+  useEffect(() => {
+    let isMounted = true;
+
+    async function fetchRequests() {
+      try {
+        // Query collaboration_requests ordered by newest first
+        const { data, error } = await supabase
+          .from('collaboration_requests')
+          .select('*')
+          .order('created_at', { ascending: false });
+
+        if (error) {
+          console.warn('Error fetching collaboration requests from Supabase:', error.message);
+          if (isMounted) {
+            setIncomingRequests(prev => prev.length > 0 ? prev : DEFAULT_REQUESTS);
+          }
+          return;
+        }
+
+        if (data && data.length > 0) {
+          // Fetch incoming briefs for freelancer_id = 'FL001'
+          const targeted = data.filter(r => !r.freelancer_id || r.freelancer_id === 'FL001' || r.freelancer_id === 'c1' || r.freelancer_id === 'alex-smith');
+          const pending = targeted.filter(r => r.status === 'pending');
+          const targetRows = pending.length > 0 ? pending : (targeted.length > 0 ? targeted : data);
+
+          const formatted = targetRows.map((row, idx) => {
+            const brief = row.project_brief || {};
+            const campaignTitle = 
+              brief.title || 
+              brief.project_name || 
+              (Array.isArray(brief.brandNameSuggestions) && brief.brandNameSuggestions[0]?.name ? `${brief.brandNameSuggestions[0].name} Campaign` : null) || 
+              `Campaign Brief #${row.request_id ? row.request_id.slice(0, 8) : idx + 1}`;
+
+            const company = row.company_id === 'COMP001' ? 'Apex Creative Agency' : (row.company_id || 'Brand Partner');
+            const budget = brief.budget || (typeof brief.budgetTier === 'string' ? brief.budgetTier : '$4,500');
+            const deadline = brief.deadline || 'Dec 1, 2026';
+            const aspectRatio = brief.aspectRatio || brief.targetAspect || '16:9';
+            const style = brief.style || (brief.visualIdentity && brief.visualIdentity.designAesthetic) || 'Cinematic Generative AI Production';
+
+            return {
+              id: row.id || row.request_id || `req-${idx}`,
+              request_id: row.request_id,
+              company,
+              campaignTitle,
+              budget,
+              deadline,
+              aspectRatio,
+              style,
+              status: row.status || 'pending',
+              brief_version: row.brief_version || 1,
+              clarification_history: row.clarification_history || [],
+              project_brief: brief,
+              raw: row
+            };
+          });
+
+          if (isMounted) {
+            setIncomingRequests(formatted);
+          }
+        } else {
+          // Table empty, try backend API
+          try {
+            const apiRes = await fetch('http://localhost:3001/api/collaboration/freelancer/c1');
+            if (apiRes.ok) {
+              const apiData = await apiRes.json();
+              if (apiData.requests && apiData.requests.length > 0 && isMounted) {
+                setIncomingRequests(apiData.requests.map((r, idx) => ({
+                  id: r.request_id || `req-${idx}`,
+                  request_id: r.request_id,
+                  company: r.company_id === 'COMP001' ? 'Apex Creative Agency' : (r.company_id || 'Brand Partner'),
+                  campaignTitle: r.project_brief?.title || `Campaign #${idx + 1}`,
+                  budget: r.project_brief?.budget || '$4,500',
+                  deadline: r.project_brief?.deadline || 'Dec 1, 2026',
+                  aspectRatio: r.project_brief?.aspectRatio || '16:9',
+                  style: r.project_brief?.style || 'Cinematic Generative Production',
+                  status: r.status || 'pending',
+                  brief_version: r.brief_version || 1,
+                  clarification_history: r.clarification_history || [],
+                  project_brief: r.project_brief || {},
+                  raw: r
+                })));
+                return;
+              }
+            }
+          } catch (_) {}
+          if (isMounted) {
+            setIncomingRequests(prev => prev.length > 0 ? prev : DEFAULT_REQUESTS);
+          }
+        }
+      } catch (err) {
+        console.error('Failed to query collaboration_requests:', err);
+        if (isMounted) {
+          setIncomingRequests(prev => prev.length > 0 ? prev : DEFAULT_REQUESTS);
+        }
+      } finally {
+        if (isMounted) setLoadingRequests(false);
+      }
+    }
+
+    // Initial fetch on mount
+    fetchRequests();
+
+    // 3-second polling interval for real-time live demo updates
+    const pollInterval = setInterval(() => {
+      fetchRequests();
+    }, 3000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(pollInterval);
+    };
+  }, []);
 
   // Companies with ACCEPTED Briefs (Only these show in Communications)
   const [acceptedCompanies, setAcceptedCompanies] = useState([
@@ -117,6 +251,7 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
       name: "Volt Energy Co.",
       campaign: "Cyberpunk Beverage Ad",
       avatar: "⚡",
+      status: "confirmed",
       unread: true,
       messages: [
         { id: 1, sender: 'brand', author: 'Marcus (Volt Energy)', text: 'Hi Alex! We reviewed your Runway Gen-3 reel. Can you deliver the 16:9 cut by Friday?', time: '10:45 AM' },
@@ -128,10 +263,22 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
       name: "Nike Digital",
       campaign: "3D Generative Product Animation",
       avatar: "✔️",
+      status: "accepted",
       unread: false,
       messages: [
         { id: 1, sender: 'brand', author: 'Elena (Nike)', text: 'The Blender + Topaz renders look exceptional. Final approval granted!', time: 'Yesterday' },
         { id: 2, sender: 'creator', author: 'Alex Smith', text: 'Thanks Elena! Full commercial master files uploaded to the drive.', time: 'Yesterday' }
+      ]
+    },
+    {
+      id: "comp-3",
+      name: "Prada Future",
+      campaign: "Hyper-Real Luxury Commercial",
+      avatar: "💎",
+      status: "pending",
+      unread: false,
+      messages: [
+        { id: 1, sender: 'brand', author: 'Prada Creative', text: 'We have dispatched our creative brief and escrow deposit for your review.', time: 'Yesterday' }
       ]
     }
   ]);
@@ -140,25 +287,143 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
   const [chatInput, setChatInput] = useState('');
 
   // Handle Accept Brief
-  const handleAcceptBrief = (req) => {
+  const handleAcceptBrief = async (req) => {
+    const compName = req.company || req.name;
+
     // Check if company already in accepted
-    if (!acceptedCompanies.some(c => c.name === req.company)) {
+    if (!acceptedCompanies.some(c => c.name === compName || c.id === req.id)) {
       const newAccepted = {
-        id: `comp-${Date.now()}`,
-        name: req.company,
-        campaign: req.campaignTitle,
+        id: req.id || `comp-${Date.now()}`,
+        name: compName,
+        campaign: req.campaignTitle || req.campaign,
         avatar: "🏢",
+        status: "accepted",
         unread: false,
         messages: [
-          { id: 1, sender: 'brand', author: req.company, text: `Thank you for accepting the brief for ${req.campaignTitle}! Let's finalize the deliverables here.`, time: 'Just now' }
+          { id: 1, sender: 'brand', author: compName, text: `Thank you for accepting the brief for ${req.campaignTitle || req.campaign}! Let's finalize the deliverables here.`, time: 'Just now' }
         ]
       };
       setAcceptedCompanies(prev => [newAccepted, ...prev]);
       setActiveCompanyId(newAccepted.id);
+    } else {
+      setAcceptedCompanies(prev => prev.map(c => 
+        (c.name === compName || c.id === req.id) ? { ...c, status: 'accepted' } : c
+      ));
     }
-    // Remove from pending
-    setIncomingRequests(prev => prev.filter(r => r.id !== req.id));
+
+    // Update status in Supabase and Backend Collaboration Service
+    try {
+      if (req.request_id) {
+        // Backend API
+        await fetch(`http://localhost:3001/api/collaboration/${req.request_id}/accept`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ actor: 'freelancer' })
+        }).catch(() => {});
+
+        // Direct Supabase
+        await supabase
+          .from('collaboration_requests')
+          .update({ 
+            status: 'accepted',
+            audit_history: [
+              ...(req.raw?.audit_history || []),
+              { action: 'accepted', by: 'FL001', timestamp: new Date().toISOString() }
+            ]
+          })
+          .match({ request_id: req.request_id });
+      }
+    } catch (err) {
+      console.warn('Could not update brief status:', err);
+    }
+
+    // Update status locally to accepted
+    setIncomingRequests(prev => prev.map(r => (r.id === req.id || r.request_id === req.request_id) ? { ...r, status: 'accepted' } : r));
     setActiveTab('messages');
+  };
+
+  // Handle Decline / Reject Brief
+  const handleRejectBrief = async (req) => {
+    try {
+      if (req.request_id) {
+        await fetch(`http://localhost:3001/api/collaboration/${req.request_id}/reject`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ actor: 'freelancer', reason: 'Capacity constraints' })
+        }).catch(() => {});
+
+        await supabase
+          .from('collaboration_requests')
+          .update({ status: 'rejected' })
+          .match({ request_id: req.request_id });
+      }
+    } catch (_) {}
+
+    setIncomingRequests(prev => prev.filter(r => r.id !== req.id && r.request_id !== req.request_id));
+  };
+
+  // Submit Clarification Question
+  const handleSubmitClarification = async (questions) => {
+    if (!questions || !clarifyModalReq) return;
+    const currentFreelancerId = 'FL001';
+
+    try {
+      const reqId = clarifyModalReq.request_id || clarifyModalReq.id;
+      if (reqId) {
+        await fetch(`http://localhost:3001/api/collaboration/${reqId}/clarify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            questions: questions.trim(), 
+            message: questions.trim(), 
+            actor: 'freelancer',
+            actor_id: currentFreelancerId 
+          })
+        });
+      }
+
+      setIncomingRequests(prev => prev.map(r => {
+        if (r.id === clarifyModalReq.id || r.request_id === clarifyModalReq.request_id) {
+          const history = Array.isArray(r.clarification_history) ? [...r.clarification_history] : [];
+          history.push({
+            sender: 'freelancer',
+            content: questions.trim(),
+            timestamp: new Date().toISOString()
+          });
+          return {
+            ...r,
+            status: 'clarification_requested',
+            clarification_history: history
+          };
+        }
+        return r;
+      }));
+
+      setClarifyModalReq(null);
+    } catch (err) {
+      console.error('Failed to submit clarification:', err);
+      throw err;
+    }
+  };
+
+  // Handle Mutual Confirmation
+  const handleConfirmBrief = async (req) => {
+    try {
+      if (req.request_id) {
+        const res = await fetch(`http://localhost:3001/api/collaboration/${req.request_id}/confirm`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ actor: 'freelancer', brief_version: req.brief_version || 1 })
+        });
+        const data = await res.json();
+        if (data.request) {
+          setIncomingRequests(prev => prev.map(r => (r.id === req.id || r.request_id === req.request_id) ? { ...r, status: data.request.status } : r));
+          return;
+        }
+      }
+    } catch (_) {}
+
+    setIncomingRequests(prev => prev.map(r => (r.id === req.id || r.request_id === req.request_id) ? { ...r, status: 'confirmed' } : r));
   };
 
   // Handle Settings Save
@@ -216,26 +481,82 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
     }, 1000);
   };
 
-  // Handle Send Chat
-  const handleSendMessage = (e) => {
+  const activeCompany = acceptedCompanies.find(c => c.id === activeCompanyId) || acceptedCompanies[0];
+
+  // Active conversation requestId for Supabase sync
+  const activeRequestId = activeCompany?.id === 'comp-1'
+    ? 'REQ-DEMO-001'
+    : activeCompany?.id === 'comp-2'
+      ? 'REQ-DEMO-002'
+      : (activeCompany?.requestId || `REQ-${activeCompany?.id || 'DEMO'}`);
+
+  // Live Supabase Chat State
+  const [chatMessages, setChatMessages] = useState([]);
+
+  // Fetch live chat messages from Supabase with 2-second interval polling
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadLiveMessages() {
+      if (!activeRequestId) return;
+      const msgs = await fetchChatMessages(activeRequestId);
+      if (isMounted && msgs && msgs.length > 0) {
+        setChatMessages(msgs);
+      }
+    }
+
+    loadLiveMessages();
+
+    // 2-second interval live polling
+    const pollInterval = setInterval(() => {
+      loadLiveMessages();
+    }, 2000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(pollInterval);
+    };
+  }, [activeRequestId]);
+
+  // Handle Send Chat (Sends to Supabase public.messages)
+  const handleSendMessage = async (e) => {
     e.preventDefault();
-    if (!chatInput.trim()) return;
+    const text = chatInput.trim();
+    if (!text) return;
+
+    setChatInput('');
+
+    // Optimistically update local thread state
+    const localMsg = {
+      id: Date.now(),
+      sender: 'creator',
+      author: creator.name,
+      text: text,
+      time: 'Just now'
+    };
+
     setAcceptedCompanies(prev => prev.map(comp => {
       if (comp.id === activeCompanyId) {
         return {
           ...comp,
           messages: [
-            ...comp.messages,
-            { id: Date.now(), sender: 'creator', author: creator.name, text: chatInput, time: 'Just now' }
+            ...(comp.messages || []),
+            localMsg
           ]
         };
       }
       return comp;
     }));
-    setChatInput('');
-  };
 
-  const activeCompany = acceptedCompanies.find(c => c.id === activeCompanyId) || acceptedCompanies[0];
+    // Perform Supabase messages table insert
+    const result = await sendChatMessage(activeRequestId, 'FL001', 'freelancer', text);
+    if (result?.success) {
+      const fresh = await fetchChatMessages(activeRequestId);
+      if (fresh && fresh.length > 0) {
+        setChatMessages(fresh);
+      }
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] p-4 md:p-8 flex items-center justify-center text-slate-900 relative">
@@ -278,8 +599,15 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">{creator.title}</p>
 
+              {/* Verified Trust Badges */}
+              <div className="mt-3 flex flex-wrap items-center justify-center gap-1.5">
+                <VerificationBadge type="workflow" size="sm" />
+                <VerificationBadge type="score" score={auditScore || 96} size="sm" />
+                <VerificationBadge type="certified_pipeline" size="sm" />
+              </div>
+
               {/* Status Pill */}
-              <div className="mt-3 inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-900 text-white text-[11px] font-medium shadow-sm">
+              <div className="mt-2.5 inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-900 text-white text-[11px] font-medium shadow-sm">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                 <span>Open for Contracts</span>
               </div>
@@ -426,10 +754,15 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
               {/* Header with AI Audit Banner */}
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 mb-6 border-b border-slate-100">
                 <div>
-                  <h1 className="text-2xl font-black text-slate-900 tracking-tight">
-                    AI Portfolio & Workflow Proof
-                  </h1>
-                  <p className="text-xs text-slate-500 mt-1">
+                  <div className="flex items-center gap-2 flex-wrap mb-1">
+                    <h1 className="text-2xl font-black text-slate-900 tracking-tight">
+                      AI Portfolio & Workflow Proof
+                    </h1>
+                    <VerificationBadge type="workflow" size="sm" />
+                    <VerificationBadge type="score" score={auditScore || 96} size="sm" />
+                    <VerificationBadge type="certified_pipeline" size="sm" />
+                  </div>
+                  <p className="text-xs text-slate-500">
                     Upload generations with prompts, seeds, and models to pass automated AI scoring.
                   </p>
                 </div>
@@ -444,10 +777,7 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
                   </button>
 
                   <div className="flex items-center gap-3 bg-gradient-to-r from-orange-50 via-white to-orange-50 p-2 px-3.5 rounded-2xl border border-orange-200">
-                    <div className="text-right">
-                      <div className="text-[9px] uppercase font-bold text-slate-400">Score</div>
-                      <div className="text-lg font-extrabold text-[#FF6B00] leading-none">{auditScore}/100</div>
-                    </div>
+                    <AICreatorScoreBadge score={auditScore} />
                     <button
                       onClick={runAIAudit}
                       disabled={isAuditing}
@@ -477,9 +807,9 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
                         <Zap className="w-3 h-3 text-[#FF6B00]" />
                         <span>{item.tool}</span>
                       </div>
-                      <div className="absolute top-3 right-3 bg-emerald-500/90 text-white px-2 py-0.5 rounded-full text-[10px] font-bold flex items-center gap-1">
-                        <CheckCircle2 className="w-3 h-3" />
-                        <span>Verified Workflow</span>
+                      <div className="absolute top-3 right-3 flex items-center gap-1.5 flex-wrap">
+                        <VerificationBadge type="workflow" size="sm" className="bg-black/70 text-emerald-300 border-emerald-500/40 backdrop-blur-md" />
+                        <VerificationBadge type="certified_pipeline" size="sm" className="bg-black/70 text-blue-300 border-blue-500/40 backdrop-blur-md" />
                       </div>
                     </div>
 
@@ -502,6 +832,15 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
                           <span className="font-mono text-slate-700">{item.seed} | {item.aspectRatio}</span>
                         </div>
                       </div>
+
+                      <div className="pt-3 mt-3 border-t border-slate-200/60 flex items-center justify-between">
+                        <button
+                          onClick={() => setSelectedAssetForInspect(item)}
+                          className="text-xs text-[#FF6B00] flex items-center gap-1 font-semibold hover:underline cursor-pointer"
+                        >
+                          🔍 Inspect Prompt & Seed
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -521,7 +860,13 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
                 </p>
               </div>
 
-              {incomingRequests.length === 0 ? (
+              {loadingRequests && incomingRequests.length === 0 ? (
+                <div className="text-center py-16 bg-white rounded-2xl border border-slate-200/80 shadow-xs flex flex-col items-center justify-center">
+                  <Loader2 className="w-8 h-8 text-[#FF6B00] animate-spin mb-3" />
+                  <p className="text-xs font-bold text-slate-800">Checking Supabase for Live Brand Briefs...</p>
+                  <p className="text-[11px] text-slate-400 mt-1">Polling collaboration_requests feed every 2.5s</p>
+                </div>
+              ) : incomingRequests.length === 0 ? (
                 <div className="text-center py-16 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
                   <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto mb-2" />
                   <p className="text-sm font-bold text-slate-700">All brand briefs have been reviewed and accepted!</p>
@@ -536,45 +881,119 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
               ) : (
                 <div className="space-y-4">
                   {incomingRequests.map((req) => (
-                    <div key={req.id} className="p-5 rounded-2xl bg-slate-50 border border-slate-200/80 hover:border-orange-300 transition-all flex flex-col md:flex-row md:items-center justify-between gap-4 shadow-sm">
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
+                    <div key={req.id} className="p-5 rounded-2xl bg-white border border-slate-200/80 hover:border-orange-300 transition-all flex flex-col md:flex-row md:items-start justify-between gap-4 shadow-xs">
+                      <div className="space-y-2 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="text-xs font-bold text-[#FF6B00] bg-orange-100/70 px-2.5 py-0.5 rounded-full">
                             {req.company}
                           </span>
-                          <span className="text-xs text-slate-400">• New Brief</span>
+                          <BriefVersionBadge 
+                            version={req.brief_version || 1}
+                            revisionCount={Array.isArray(req.clarification_history) ? req.clarification_history.length + 1 : (req.raw?.revision_history?.length || 1)}
+                            status={req.status || 'pending'}
+                          />
+                          {req.request_id && (
+                            <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full flex items-center gap-1">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                              Live Sync
+                            </span>
+                          )}
                         </div>
                         <h3 className="font-extrabold text-base text-slate-900">{req.campaignTitle}</h3>
                         <p className="text-xs text-slate-600 max-w-xl">
                           <span className="font-semibold text-slate-800">Style Requirement: </span>{req.style}
                         </p>
+                        {req.project_brief?.targetAudience && (
+                          <p className="text-[11px] text-slate-500 max-w-xl">
+                            <span className="font-semibold text-slate-700">Target Audience: </span>
+                            {typeof req.project_brief.targetAudience === 'object' 
+                              ? (req.project_brief.targetAudience.primaryAudience || JSON.stringify(req.project_brief.targetAudience))
+                              : req.project_brief.targetAudience}
+                          </p>
+                        )}
                         <div className="flex flex-wrap gap-3 text-[11px] text-slate-500 pt-1">
                           <span className="flex items-center gap-1 font-bold text-slate-800 bg-emerald-50 text-emerald-800 px-2 py-0.5 rounded-md border border-emerald-200/60">
                             <DollarSign className="w-3.5 h-3.5 text-emerald-600" /> {req.budget}
                           </span>
-                          <span className="flex items-center gap-1 bg-white px-2 py-0.5 rounded-md border border-slate-200">
-                            <Clock className="w-3.5 h-3.5 text-slate-400" /> Deadline: {req.deadline}
+                          <span className="flex items-center gap-1 bg-slate-50 px-2 py-0.5 rounded-md border border-slate-200">
+                            <Clock className="w-3.5 h-3.5 text-slate-400" /> Timeline: {req.deadline}
                           </span>
-                          <span className="flex items-center gap-1 bg-white px-2 py-0.5 rounded-md border border-slate-200">
+                          <span className="flex items-center gap-1 bg-slate-50 px-2 py-0.5 rounded-md border border-slate-200">
                             <Ratio className="w-3.5 h-3.5 text-slate-400" /> {req.aspectRatio}
                           </span>
                         </div>
+
+                        {/* Clarification History Thread */}
+                        {Array.isArray(req.clarification_history) && req.clarification_history.length > 0 && (
+                          <div className="mt-3 p-3 bg-purple-50/60 border border-purple-200 rounded-xl space-y-1.5 text-xs">
+                            <span className="text-[10px] uppercase font-bold text-purple-700 block tracking-wider">
+                              Clarification History ({req.clarification_history.length}):
+                            </span>
+                            {req.clarification_history.map((c, i) => (
+                              <div key={i} className="flex items-start gap-2 text-[11px]">
+                                <span className="font-bold text-slate-900 capitalize shrink-0">{c.sender}:</span>
+                                <span className="text-slate-700">{c.content}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
 
+                      {/* Interactive Actions per Collaboration Lifecycle State */}
                       <div className="flex md:flex-col gap-2 shrink-0">
-                        <button 
-                          onClick={() => handleAcceptBrief(req)}
-                          className="px-4 py-2.5 bg-[#FF6B00] hover:bg-[#E05E00] text-white text-xs font-bold rounded-xl shadow-sm transition-all flex items-center justify-center gap-1.5 cursor-pointer"
-                        >
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          <span>Accept & Open Chat</span>
-                        </button>
-                        <button 
-                          onClick={() => setIncomingRequests(prev => prev.filter(r => r.id !== req.id))}
-                          className="px-4 py-2 bg-white hover:bg-slate-100 text-slate-600 border border-slate-200 text-xs font-semibold rounded-xl transition-all cursor-pointer"
-                        >
-                          Decline
-                        </button>
+                        {(!req.status || req.status === 'pending' || req.status === 'clarification_requested') && (
+                          <>
+                            <button 
+                              onClick={() => handleAcceptBrief(req)}
+                              className="px-4 py-2 bg-[#FF6B00] hover:bg-[#E05E00] text-white text-xs font-bold rounded-xl shadow-sm transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              <span>Accept Scope</span>
+                            </button>
+                            <button 
+                              onClick={() => setClarifyModalReq(req)}
+                              className="px-4 py-2 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 text-xs font-bold rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                            >
+                              <HelpCircle className="w-3.5 h-3.5 text-amber-600" />
+                              <span>Request Clarification</span>
+                            </button>
+                            <button 
+                              onClick={() => handleRejectBrief(req)}
+                              className="px-4 py-1.5 bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 text-xs font-medium rounded-xl transition-all cursor-pointer"
+                            >
+                              Decline Offer
+                            </button>
+                          </>
+                        )}
+
+                        {req.status === 'accepted' && (
+                          <>
+                            <button 
+                              onClick={() => handleConfirmBrief(req)}
+                              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl shadow-sm transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              <span>Confirm Terms & Lock</span>
+                            </button>
+                            <button 
+                              onClick={() => setActiveTab('messages')}
+                              className="px-4 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1"
+                            >
+                              <MessageSquare className="w-3.5 h-3.5" />
+                              <span>Open Chat</span>
+                            </button>
+                          </>
+                        )}
+
+                        {req.status === 'confirmed' && (
+                          <button 
+                            onClick={() => setActiveTab('messages')}
+                            className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-sm transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                          >
+                            <MessageSquare className="w-3.5 h-3.5 text-[#FF6B00]" />
+                            <span>Active Project Room</span>
+                          </button>
+                        )}
                       </div>
                     </div>
                   ))}
@@ -628,9 +1047,17 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
                 </div>
 
                 {/* Right: Live Thread with Selected Company */}
-                <div className="md:col-span-2 p-4 flex flex-col justify-between bg-slate-50">
+                <div className="relative md:col-span-2 p-4 flex flex-col justify-between bg-slate-50 min-h-[420px]">
                   {activeCompany ? (
                     <>
+                      {/* Accepted-Only Communication Lockout Overlay */}
+                      <ChatLockoutOverlay
+                        status={activeCompany.status || 'accepted'}
+                        role="creator"
+                        campaignTitle={activeCompany.campaign}
+                        onTriggerAction={() => handleAcceptBrief(activeCompany)}
+                      />
+
                       <div className="pb-3 mb-3 border-b border-slate-200/80 flex items-center justify-between">
                         <div className="flex items-center gap-2.5">
                           <div className="w-8 h-8 rounded-lg bg-slate-900 text-white flex items-center justify-center font-bold text-xs">
@@ -641,15 +1068,36 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
                             <p className="text-[10px] text-slate-500">{activeCompany.campaign}</p>
                           </div>
                         </div>
-                        <div className="text-[10px] font-semibold text-emerald-600 bg-emerald-50 border border-emerald-100 px-2.5 py-1 rounded-full flex items-center gap-1.5">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                          <span>Active Thread</span>
+                        <div className={`text-[10px] font-semibold px-2.5 py-1 rounded-full flex items-center gap-1.5 ${
+                          (activeCompany.status === 'accepted' || activeCompany.status === 'confirmed')
+                            ? 'text-emerald-600 bg-emerald-50 border border-emerald-100'
+                            : 'text-amber-700 bg-amber-50 border border-amber-200'
+                        }`}>
+                          <span className={`w-1.5 h-1.5 rounded-full ${
+                            (activeCompany.status === 'accepted' || activeCompany.status === 'confirmed')
+                              ? 'bg-emerald-500 animate-pulse'
+                              : 'bg-amber-500'
+                          }`} />
+                          <span>
+                            {(activeCompany.status === 'accepted' || activeCompany.status === 'confirmed')
+                              ? 'Active Thread'
+                              : 'Pending Scope Acceptance'}
+                          </span>
                         </div>
                       </div>
 
                       {/* Messages Stream */}
                       <div className="flex-1 space-y-3 overflow-y-auto max-h-[320px] p-2">
-                        {activeCompany.messages.map((m) => (
+                        {(chatMessages.length > 0
+                          ? chatMessages.map((m) => ({
+                              id: m.message_id || m.id,
+                              sender: m.sender_role === 'freelancer' ? 'creator' : 'brand',
+                              author: m.sender_role === 'freelancer' ? creator.name : (activeCompany?.name || 'Brand Partner'),
+                              text: m.text_content || m.content || m.text,
+                              time: m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Just now'
+                            }))
+                          : (activeCompany?.messages || [])
+                        ).map((m) => (
                           <div key={m.id} className={`flex flex-col ${m.sender === 'creator' ? 'items-end' : 'items-start'}`}>
                             <span className="text-[10px] text-slate-400 font-medium mb-1">{m.author} • {m.time}</span>
                             <div className={`p-3 rounded-2xl text-xs max-w-md ${
@@ -669,12 +1117,18 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
                           type="text"
                           value={chatInput}
                           onChange={(e) => setChatInput(e.target.value)}
-                          placeholder={`Message ${activeCompany.name}...`}
-                          className="flex-1 bg-white border border-slate-200 focus:border-[#FF6B00] focus:ring-2 focus:ring-orange-500/20 rounded-xl px-4 py-2.5 text-xs text-slate-900 outline-none transition-all"
+                          disabled={activeCompany.status !== 'accepted' && activeCompany.status !== 'confirmed'}
+                          placeholder={
+                            (activeCompany.status !== 'accepted' && activeCompany.status !== 'confirmed')
+                              ? "Chat is locked until proposal is accepted"
+                              : `Message ${activeCompany.name}...`
+                          }
+                          className="flex-1 bg-white border border-slate-200 focus:border-[#FF6B00] focus:ring-2 focus:ring-orange-500/20 rounded-xl px-4 py-2.5 text-xs text-slate-900 outline-none transition-all disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                         />
                         <button
                           type="submit"
-                          className="bg-[#FF6B00] hover:bg-[#E05E00] text-white font-bold px-4 py-2.5 rounded-xl text-xs flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
+                          disabled={activeCompany.status !== 'accepted' && activeCompany.status !== 'confirmed'}
+                          className="bg-[#FF6B00] hover:bg-[#E05E00] text-white font-bold px-4 py-2.5 rounded-xl text-xs flex items-center gap-1.5 shadow-sm transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                         >
                           <Send className="w-3.5 h-3.5" />
                           <span>Send</span>
@@ -956,6 +1410,21 @@ export default function CreatorDashboard({ onLogout, onSwitchToCompany }) {
           </div>
         </div>
       )}
+
+      {/* Clarification Request Modal */}
+      <ClarificationModal
+        isOpen={!!clarifyModalReq}
+        onClose={() => setClarifyModalReq(null)}
+        request={clarifyModalReq}
+        onSubmit={handleSubmitClarification}
+      />
+
+      {/* Prompt & Seed Inspector Modal */}
+      <PromptInspectorModal 
+        isOpen={!!selectedAssetForInspect} 
+        onClose={() => setSelectedAssetForInspect(null)} 
+        item={selectedAssetForInspect} 
+      />
 
     </div>
   );
